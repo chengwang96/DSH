@@ -5,8 +5,10 @@ const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const fsp = fs.promises;
 const http = require('node:http');
+const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
+const { startOpenCodeProxy, DEFAULT_PORT: PROXY_DEFAULT_PORT } = require('./proxy.js');
 
 const APP_NAME = 'DeepSeek Harness';
 const STARTUP_TIMEOUT_MS = 120_000;
@@ -71,6 +73,109 @@ function saveConfig(patch) {
   fs.mkdirSync(path.dirname(configPath()), { recursive: true });
   fs.writeFileSync(configPath(), JSON.stringify(next, null, 2), 'utf8');
   return next;
+}
+
+// ---------------------------------------------------------------------------
+// OpenCode multi-key failover proxy (in-process, binds 127.0.0.1)
+// ---------------------------------------------------------------------------
+// Key pool lives in ~/.dsh/opencode-proxy.json so it is shared with the CLI
+// runner and is NOT part of the repo.
+function proxyConfigPath() {
+  return path.join(DSH_HOME, 'opencode-proxy.json');
+}
+
+function readProxyConfig() {
+  try {
+    const raw = fs.readFileSync(proxyConfigPath(), 'utf8');
+    const cfg = JSON.parse(raw);
+    cfg.keys = (Array.isArray(cfg.keys) ? cfg.keys : []).map((k) => String(k).trim()).filter(Boolean);
+    return cfg;
+  } catch (_err) {
+    return { enabled: true, port: PROXY_DEFAULT_PORT, keys: [], activeIndex: 0, usage: [] };
+  }
+}
+
+function writeProxyConfig({ enabled, port, keys }) {
+  const prev = readProxyConfig();
+  const next = {
+    enabled: enabled !== false,
+    port: Number(port) || PROXY_DEFAULT_PORT,
+    keys,
+    activeIndex: 0,
+    // 按位置保留用量统计：key 列表增删时尽量不丢已有计数
+    usage: keys.map((_k, i) => (prev.usage && prev.usage[i]) || { requests: 0, inputTokens: 0, outputTokens: 0, quotaFailures: 0, lastUsedAt: null }),
+  };
+  fs.mkdirSync(path.dirname(proxyConfigPath()), { recursive: true });
+  fs.writeFileSync(proxyConfigPath(), JSON.stringify(next, null, 2), 'utf8');
+  return next;
+}
+
+let proxyHandle = null;
+
+function proxyActive() {
+  const cfg = readProxyConfig();
+  return cfg.enabled !== false && cfg.keys.length > 0;
+}
+
+function startProxy() {
+  stopProxy();
+  const cfg = readProxyConfig();
+  if (cfg.enabled === false || cfg.keys.length === 0) {
+    log('proxy: not started (disabled or no keys)');
+    return;
+  }
+  try {
+    proxyHandle = startOpenCodeProxy({
+      configPath: proxyConfigPath(),
+      log: (msg) => log(`[proxy] ${msg}`),
+    });
+    log(`proxy: listening on http://127.0.0.1:${proxyHandle.getState().port}`);
+    syncProxyBaseUrl(true);
+  } catch (err) {
+    log(`proxy: start failed: ${err && err.message}`);
+    proxyHandle = null;
+  }
+}
+
+function stopProxy() {
+  if (proxyHandle) {
+    try { proxyHandle.stop(); } catch (_err) { /* ignore */ }
+    proxyHandle = null;
+  }
+}
+
+// Keep settings.yaml's opencode-go route pointing at the local proxy while it
+// is active (and remove the override when it is not), so a stale baseURL can
+// never strand the provider. Only the `baseURL:` line inside the opencode-go
+// sub-block is added/removed; every other field stays untouched. The dsh
+// backend hot-reloads this change.
+function syncProxyBaseUrl(active) {
+  try {
+    const settingsFile = path.join(DSH_HOME, 'settings.yaml');
+    const existing = readText(settingsFile) || '';
+    const lines = existing.split(/\r?\n/);
+    const idx = lines.findIndex((l) => /^    opencode-go:\s*$/.test(l));
+    if (idx < 0) return;
+    let end = idx;
+    for (let i = idx + 1; i < lines.length; i++) {
+      if (lines[i].trim() === '' || /^\s{6,}\S/.test(lines[i])) end = i;
+      else break;
+    }
+    const block = lines.slice(idx + 1, end + 1).filter((l) => !/^\s{6}baseURL:\s*/.test(l));
+    if (active) {
+      const port = readProxyConfig().port || PROXY_DEFAULT_PORT;
+      const apiIdx = block.findIndex((l) => /^\s{6}apiKeyEnv:\s*/.test(l));
+      const baseLine = `      baseURL: http://127.0.0.1:${port}`;
+      block.splice(apiIdx >= 0 ? apiIdx + 1 : 0, 0, baseLine);
+    }
+    const next = [...lines.slice(0, idx), '    opencode-go:', ...block, ...lines.slice(end + 1)].join('\n');
+    if (next !== existing) {
+      fs.writeFileSync(settingsFile, next, 'utf8');
+      log(`proxy: settings.yaml opencode-go baseURL ${active ? '→ 127.0.0.1:' + readProxyConfig().port : 'removed'}`);
+    }
+  } catch (err) {
+    log(`proxy: sync settings.yaml failed: ${err && err.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +249,54 @@ function escapeRegExp(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Read a flat `KEY: value` entry from ~/.dsh/.credentials.yaml (no YAML parser
+// needed for this shape; strips surrounding quotes).
+function readCredential(name) {
+  try {
+    const text = readText(path.join(DSH_HOME, '.credentials.yaml')) || '';
+    const match = text.match(new RegExp(`^${escapeRegExp(name)}:\\s*(.+)$`, 'm'));
+    if (!match) return '';
+    let value = match[1].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    return value;
+  } catch (_err) {
+    return '';
+  }
+}
+
+// DeepSeek 官方余额接口：GET https://api.deepseek.com/user/balance
+function fetchDeepSeekBalance(apiKey) {
+  return new Promise((resolve) => {
+    const req = https.get('https://api.deepseek.com/user/balance', {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      timeout: 15000,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        if (res.statusCode === 200) {
+          try {
+            resolve({ ok: true, data: JSON.parse(body) });
+          } catch (_err) {
+            resolve({ ok: false, error: '余额接口返回的数据无法解析' });
+          }
+        } else if (res.statusCode === 401) {
+          resolve({ ok: false, error: 'API Key 无效（HTTP 401）' });
+        } else if (res.statusCode === 402) {
+          resolve({ ok: false, error: '账户余额不足或不可用（HTTP 402）' });
+        } else {
+          resolve({ ok: false, error: `HTTP ${res.statusCode}: ${body.slice(0, 200)}` });
+        }
+      });
+    });
+    req.on('timeout', () => { req.destroy(new Error('查询超时')); });
+    req.on('error', (err) => resolve({ ok: false, error: `请求失败：${err && err.message || err}` }));
+  });
+}
+
 // Write the credentials key -> env var mapping and the model/provider settings.
 // The harness resolves `llm-pi-ai.providers.<id>.apiKeyEnv` to the env var in
 // .credentials.yaml. We support two provider families:
@@ -193,9 +346,10 @@ function defaultDeepseekModel(_settingsFile) {
 }
 
 // Rewrite settings.yaml so agent-default-model points at the given provider and
-// llm-pi-ai.providers.<id> uses apiKeyEnv. We reconstruct only these sections
-// and leave everything else intact via a very simple line-based editor that
-// understands the flat `llm-pi-ai:` ... `providers:` ... `    <id>:` nesting.
+// llm-pi-ai.providers.<id> uses apiKeyEnv. Only the agent-default-model block
+// and the single provider sub-block are touched; every other provider block
+// (e.g. a user-added ollama route) stays intact. When the multi-key proxy is
+// active, the opencode-go route also gets a baseURL override to the proxy.
 function updateSettingsForProvider(settingsFile, providerId, apiKeyEnv, model) {
   fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
   const existing = readText(settingsFile) || '';
@@ -208,21 +362,23 @@ function updateSettingsForProvider(settingsFile, providerId, apiKeyEnv, model) {
     `  model: ${model}`,
   ]);
 
-  // 2) llm-pi-ai.providers.<id>.apiKeyEnv — insert/refresh.
-  // Minimal robust approach: rebuild the llm-pi-ai block if present, else append.
+  // 2) llm-pi-ai.providers.<id> — insert/refresh only this provider's block.
+  const providerLines = () => {
+    const out = [`      apiKeyEnv: ${apiKeyEnv}`];
+    if (providerId === 'opencode-go' && proxyActive()) {
+      const port = readProxyConfig().port || PROXY_DEFAULT_PORT;
+      out.push(`      baseURL: http://127.0.0.1:${port}`);
+    }
+    return out;
+  };
   if (hasTopLevelKey(text, 'llm-pi-ai')) {
-    text = replaceYamlBlock(text, 'llm-pi-ai', [
-      `llm-pi-ai:`,
-      `  providers:`,
-      `    ${providerId}:`,
-      `      apiKeyEnv: ${apiKeyEnv}`,
-    ]);
+    text = upsertProviderSubBlock(text, providerId, providerLines);
   } else {
     text = appendBlock(text, [
       `llm-pi-ai:`,
       `  providers:`,
       `    ${providerId}:`,
-      `      apiKeyEnv: ${apiKeyEnv}`,
+      ...providerLines(),
     ]);
   }
 
@@ -272,6 +428,35 @@ function appendBlock(text, newLines) {
   const trimmed = text.replace(/\s+$/, '');
   const base = trimmed.length ? trimmed + '\n' : '';
   return base + newLines.join('\n') + '\n';
+}
+
+// Insert-or-replace ONE provider sub-block (`    <id>:` at indent 4 plus its
+// indent-6 children) inside the existing `llm-pi-ai.providers` section,
+// leaving sibling provider blocks (e.g. ollama) untouched. Returns the new
+// text, or the original text when the section does not exist yet.
+function upsertProviderSubBlock(text, providerId, makeLines) {
+  const lines = text.split(/\r?\n/);
+  const providerRe = new RegExp(`^    ${escapeRegExp(providerId)}:\\s*$`);
+  const idx = lines.findIndex((l) => providerRe.test(l));
+  if (idx >= 0) {
+    // Replace the existing sub-block: it ends at the first following line that
+    // is neither blank nor indented >= 6 spaces.
+    let end = idx;
+    for (let i = idx + 1; i < lines.length; i++) {
+      if (lines[i].trim() === '' || /^\s{6,}\S/.test(lines[i])) end = i;
+      else break;
+    }
+    const next = [...lines.slice(0, idx), `    ${providerId}:`, ...makeLines(), ...lines.slice(end + 1)];
+    return next.join('\n');
+  }
+  // Append after `  providers:` under the existing `llm-pi-ai:` block.
+  const piIdx = lines.findIndex((l) => /^llm-pi-ai:\s*$/.test(l));
+  if (piIdx < 0) return text;
+  const provIdx = lines.findIndex((l, i) => i > piIdx && /^  providers:\s*$/.test(l));
+  if (provIdx < 0) return text;
+  const insertAt = provIdx + 1;
+  const next = [...lines.slice(0, insertAt), `    ${providerId}:`, ...makeLines(), ...lines.slice(insertAt)];
+  return next.join('\n');
 }
 
 function isFirstRun() {
@@ -410,7 +595,7 @@ async function startBackend() {
   const port = await pickPort(config);
   backendUrl = `http://${config.host}:${port}`;
 
-  const args = [runtime.dshBin, 'web', '--host', config.host, '--port', String(port)];
+  const args = [runtime.dshBin, 'web', '--host', config.host, '--port', String(port), '--no-open'];
   const env = { ...process.env, DSH_HOME: config.dshHome || DSH_HOME };
 
   log(`spawning node="${runtime.nodeExe}" args="${args.join(' ')}" DSH_HOME=${env.DSH_HOME}`);
@@ -570,6 +755,16 @@ function settingsHtml() {
   .row { display:flex; gap:8px; align-items:center; }
   .row input { flex:1; }
   input { width:100%; box-sizing:border-box; padding:9px 11px; border-radius:9px; border:1px solid ${dark ? '#2b3a4b' : '#d7e4e7'}; background:${dark ? '#111923' : '#fbfdfd'}; color:inherit; font-size:13px; }
+  textarea { width:100%; box-sizing:border-box; padding:9px 11px; border-radius:9px; border:1px solid ${dark ? '#2b3a4b' : '#d7e4e7'}; background:${dark ? '#111923' : '#fbfdfd'}; color:inherit; font-size:12px; font-family:Consolas,monospace; resize:vertical; }
+  label.check { display:flex; align-items:center; gap:8px; margin:12px 0 6px; }
+  label.check input { width:auto; margin:0; }
+  .usage-table { width:100%; border-collapse:collapse; font-size:12px; margin-top:10px; }
+  .usage-table th, .usage-table td { padding:5px 8px; border-bottom:1px solid ${dark ? '#2b3a4b' : '#e3edef'}; text-align:right; white-space:nowrap; }
+  .usage-table th:first-child, .usage-table td:first-child { text-align:left; }
+  .usage-table .active { color:#30a46c; font-weight:600; }
+  #proxyStatus { min-height:18px; margin-top:10px; font-size:13px; }
+  #proxyStatus.ok { color:#30a46c; }
+  #proxyStatus.err { color:#e5484d; }
   button { padding:8px 14px; border-radius:9px; border:1px solid ${dark ? '#2b3a4b' : '#d7e4e7'}; background:${dark ? '#1f2a37' : '#f3f7f8'}; color:inherit; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap; }
   button.primary { background:#0f7f91; border-color:#0f7f91; color:#fff; }
   button.primary:hover { background:#0d6f80; }
@@ -620,6 +815,32 @@ function settingsHtml() {
     <p class="hint">DSH_HOME 是 dsh 的家目录（凭据、会话、配置），默认 <code>${escapeHtml(DSH_HOME)}</code>。</p>
   </section>
 
+  <section>
+    <h2>OpenCode 多 Key 代理（故障转移）</h2>
+    <p class="hint">把多把 OpenCode API Key 放进轮换池，某把 Key 配额耗尽（401/402/429）时自动切换下一把并重试同一请求。DSH 的 <code>opencode-go</code> 路由会自动指向本机代理；用量按 Key 分别统计（请求数 / 输入 token / 输出 token）。Key 仅保存在本机 DSH_HOME，不会进入项目仓库。</p>
+    <label class="check"><input id="proxyEnabled" type="checkbox"> 启用本地代理</label>
+    <label for="proxyPort">代理端口</label>
+    <input id="proxyPort" type="number" min="1024" max="65535" placeholder="8787">
+    <label for="proxyKeys">API Key 列表（每行一把，按顺序轮换）</label>
+    <textarea id="proxyKeys" rows="4" placeholder="sk-…（每行一把）" spellcheck="false"></textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="proxySave" type="button">保存代理配置</button>
+      <button id="proxyRotate" type="button">立即切换下一把 Key</button>
+      <button id="proxyRefresh" type="button">刷新用量</button>
+    </div>
+    <div id="proxyUsage"></div>
+    <div id="proxyStatus"></div>
+  </section>
+
+  <section>
+    <h2>DeepSeek 官方 API 余额</h2>
+    <p class="hint">调用 DeepSeek 官方余额接口（<code>api.deepseek.com/user/balance</code>），凭据取自 <code>.credentials.yaml</code> 里的 <code>DEEPSEEK_API_KEY</code>。</p>
+    <div class="row">
+      <button id="dsBalanceRefresh" type="button">刷新余额</button>
+    </div>
+    <div id="dsBalance"></div>
+  </section>
+
   <div class="actions">
     <button id="test" type="button">测试连接</button>
     <button id="save" class="primary" type="button">保存并重启</button>
@@ -667,6 +888,99 @@ function settingsHtml() {
       setSaveStatus((res && res.error) || '保存失败', 'err');
     }
   });
+
+  // ---- OpenCode 多 Key 代理 ----
+  function maskKey(k) {
+    if (!k) return '';
+    if (k.startsWith('sk-')) return k.length <= 12 ? 'sk-***' : k.slice(0, 7) + '…' + k.slice(-4);
+    return k.length <= 6 ? '******' : k.slice(0, 2) + '…' + k.slice(-2);
+  }
+  function fmtTokens(n) {
+    n = Number(n) || 0;
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+    return String(n);
+  }
+  function setProxyStatus(msg, cls) { const el = $('proxyStatus'); el.textContent = msg || ''; el.className = cls || ''; }
+  function renderProxy(state) {
+    if (!state) return;
+    $('proxyEnabled').checked = state.enabled !== false;
+    $('proxyPort').value = state.port || 8787;
+    $('proxyKeys').value = (state.keys || []).join('\\n');
+    const usage = state.usage || [];
+    if (!usage.length) { $('proxyUsage').innerHTML = ''; return; }
+    const rows = usage.map((u, i) => {
+      const active = i === state.activeIndex ? ' class="active"' : '';
+      const last = u.lastUsedAt ? new Date(u.lastUsedAt).toLocaleTimeString() : '—';
+      return '<tr' + active + '><td>' + (active ? '● ' : '○ ') + maskKey((state.keys || [])[i]) + '</td>' +
+        '<td>' + (u.requests || 0) + ' 次</td>' +
+        '<td>入 ' + fmtTokens(u.inputTokens) + '</td>' +
+        '<td>出 ' + fmtTokens(u.outputTokens) + '</td>' +
+        '<td>失败 ' + (u.quotaFailures || 0) + '</td>' +
+        '<td>' + last + '</td></tr>';
+    }).join('');
+    $('proxyUsage').innerHTML =
+      '<table class="usage-table"><thead><tr><th>Key（● = 当前）</th><th>请求</th><th>输入</th><th>输出</th><th>配额失败</th><th>最近使用</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table>';
+  }
+  async function loadProxy() {
+    const res = await window.dshDesktop.proxyGetState();
+    if (res && res.ok) {
+      renderProxy(res);
+      setProxyStatus(res.running ? '代理运行中：' + res.url : '代理未运行' + (res.enabled !== false ? '（无 Key 或未启用）' : '（已停用）'), res.running ? 'ok' : '');
+    } else {
+      setProxyStatus((res && res.error) || '读取代理状态失败', 'err');
+    }
+  }
+  $('proxySave').addEventListener('click', async () => {
+    setProxyStatus('正在保存…');
+    const keys = $('proxyKeys').value.split(/\\r?\\n/).map((s) => s.trim()).filter(Boolean);
+    const res = await window.dshDesktop.proxySaveConfig({
+      enabled: $('proxyEnabled').checked,
+      port: Number($('proxyPort').value) || 8787,
+      keys,
+    });
+    if (res && res.ok) {
+      renderProxy(res.state);
+      setProxyStatus(res.state.running ? '已保存，代理运行中：' + res.state.url : '已保存，代理已停用', res.state.running ? 'ok' : '');
+    } else {
+      setProxyStatus((res && res.error) || '保存失败', 'err');
+    }
+  });
+  $('proxyRotate').addEventListener('click', async () => {
+    const res = await window.dshDesktop.proxyRotate();
+    if (res && res.ok) { renderProxy(res.state); setProxyStatus('已切换到下一把 Key', 'ok'); }
+    else setProxyStatus((res && res.error) || '切换失败', 'err');
+  });
+  $('proxyRefresh').addEventListener('click', async () => {
+    await loadProxy();
+    setProxyStatus('已刷新', 'ok');
+  });
+  void loadProxy();
+
+  // ---- DeepSeek 官方余额 ----
+  async function loadBalance() {
+    const el = $('dsBalance');
+    el.innerHTML = '<span style="color:' + (${dark} ? '#8da0b4' : '#637484') + '">查询中…</span>';
+    const res = await window.dshDesktop.deepseekBalance();
+    if (!res || !res.ok) {
+      el.innerHTML = '<span style="color:#e5484d">' + ((res && res.error) || '查询失败') + '</span>';
+      return;
+    }
+    const d = res.data || {};
+    const rows = (d.balance_infos || []).map((b) =>
+      '<tr><td>' + (b.currency || '') + '</td>' +
+      '<td>' + (b.total_balance ?? '') + '</td>' +
+      '<td>' + (b.topped_up_balance ?? '') + '</td>' +
+      '<td>' + (b.granted_balance ?? '') + '</td></tr>'
+    ).join('');
+    el.innerHTML =
+      (d.is_available ? '<span style="color:#30a46c">● 账户可用</span>' : '<span style="color:#e5484d">● 账户不可用</span>') +
+      '<table class="usage-table"><thead><tr><th>币种</th><th>总余额</th><th>充值余额</th><th>赠送余额</th></tr></thead><tbody>' +
+      rows + '</tbody></table>';
+  }
+  $('dsBalanceRefresh').addEventListener('click', loadBalance);
+  void loadBalance();
 </script>
 </body>
 </html>`;
@@ -778,6 +1092,15 @@ if (!gotSingleInstanceLock) {
     return { ok: true };
   });
 
+  ipcMain.handle('dsh:zoom-by-wheel', (_event, direction) => {
+    const wc = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+    if (wc) {
+      const level = wc.getZoomLevel() + (direction > 0 ? 0.5 : -0.5);
+      wc.setZoomLevel(level);
+    }
+    return { ok: true };
+  });
+
   ipcMain.handle('dsh:get-settings', () => {
     const config = loadConfig();
     const detected = detectRuntime();
@@ -808,6 +1131,70 @@ if (!gotSingleInstanceLock) {
       return { ok: false, error: String(err && err.message || err) };
     }
   });
+
+  // ---- OpenCode multi-key proxy -----------------------------------------
+  ipcMain.handle('dsh:proxy-get-state', () => {
+    const cfg = readProxyConfig();
+    const live = proxyHandle ? proxyHandle.getState() : null;
+    return {
+      ok: true,
+      running: Boolean(live),
+      url: live ? live.url : `http://127.0.0.1:${cfg.port || PROXY_DEFAULT_PORT}`,
+      enabled: cfg.enabled !== false,
+      port: cfg.port || PROXY_DEFAULT_PORT,
+      keys: cfg.keys,
+      activeIndex: live ? live.activeIndex : cfg.activeIndex,
+      usage: live ? live.usage : cfg.usage,
+      configPath: proxyConfigPath(),
+    };
+  });
+
+  ipcMain.handle('dsh:proxy-save-config', (_event, payload) => {
+    try {
+      const enabled = payload && payload.enabled !== undefined ? payload.enabled !== false : true;
+      const port = Number(payload && payload.port) || PROXY_DEFAULT_PORT;
+      const keys = Array.isArray(payload && payload.keys)
+        ? payload.keys.map((k) => String(k).trim()).filter(Boolean)
+        : [];
+      writeProxyConfig({ enabled, port, keys });
+      startProxy(); // restarts (or stops) the in-process server with the new config
+      return { ok: true, state: ipcMainStateProxy() };
+    } catch (err) {
+      log(`proxy-save-config failed: ${err && err.message}`);
+      return { ok: false, error: String(err && err.message || err) };
+    }
+  });
+
+  ipcMain.handle('dsh:proxy-rotate', () => {
+    try {
+      const live = proxyHandle ? proxyHandle.rotate() : null;
+      return { ok: true, state: live || ipcMainStateProxy() };
+    } catch (err) {
+      return { ok: false, error: String(err && err.message || err) };
+    }
+  });
+
+  // ---- DeepSeek 官方余额 ------------------------------------------------
+  ipcMain.handle('dsh:deepseek-balance', async () => {
+    const key = readCredential('DEEPSEEK_API_KEY');
+    if (!key) {
+      return { ok: false, error: '未在 .credentials.yaml 中找到 DEEPSEEK_API_KEY' };
+    }
+    return await fetchDeepSeekBalance(key);
+  });
+
+  function ipcMainStateProxy() {
+    const cfg = readProxyConfig();
+    return {
+      running: Boolean(proxyHandle),
+      url: `http://127.0.0.1:${cfg.port || PROXY_DEFAULT_PORT}`,
+      enabled: cfg.enabled !== false,
+      port: cfg.port || PROXY_DEFAULT_PORT,
+      keys: cfg.keys,
+      activeIndex: cfg.activeIndex,
+      usage: cfg.usage,
+    };
+  }
 
   // Native file picker. `kind` filters the visible file extensions.
   ipcMain.handle('dsh:pick-file', async (_event, payload) => {
@@ -876,6 +1263,7 @@ if (!gotSingleInstanceLock) {
 
   app.whenReady().then(() => {
     setMenu();
+    startProxy();
     const window = createMainWindow();
 
     if (isFirstRun()) {
@@ -899,10 +1287,12 @@ if (!gotSingleInstanceLock) {
 
   app.on('before-quit', () => {
     stopBackend();
+    stopProxy();
   });
 
   app.on('will-quit', () => {
     stopBackend();
+    stopProxy();
   });
 
   let bootInFlight = false;
@@ -951,6 +1341,11 @@ if (!gotSingleInstanceLock) {
         label: '视图',
         submenu: [
           { role: 'reload', label: '重新加载' },
+          { type: 'separator' },
+          { role: 'zoomIn', label: '放大', accelerator: 'CmdOrCtrl+=' },
+          { role: 'zoomOut', label: '缩小', accelerator: 'CmdOrCtrl+-' },
+          { role: 'resetZoom', label: '实际大小', accelerator: 'CmdOrCtrl+0' },
+          { type: 'separator' },
           { role: 'togglefullscreen', label: '切换全屏' },
         ],
       },

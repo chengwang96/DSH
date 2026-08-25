@@ -25,6 +25,8 @@
     "files": [
       "main.js",
       "preload.js",
+      "proxy.js",
+      "opencode-proxy-cli.js",
       "welcome.html",
       "package.json"
     ],
