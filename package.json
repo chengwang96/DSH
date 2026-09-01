@@ -27,6 +27,9 @@
       "preload.js",
       "proxy.js",
       "opencode-proxy-cli.js",
+      "ollama-proxy.js",
+      "ollama-proxy-cli.js",
+      "ollama-switch-account.ps1",
       "welcome.html",
       "package.json"
     ],

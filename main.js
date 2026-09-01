@@ -9,6 +9,7 @@ const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
 const { startOpenCodeProxy, DEFAULT_PORT: PROXY_DEFAULT_PORT } = require('./proxy.js');
+const { startOllamaProxy, DEFAULT_PORT: OLLAMA_PROXY_DEFAULT_PORT } = require('./ollama-proxy.js');
 
 const APP_NAME = 'DeepSeek Harness';
 const STARTUP_TIMEOUT_MS = 120_000;
@@ -175,6 +176,103 @@ function syncProxyBaseUrl(active) {
     }
   } catch (err) {
     log(`proxy: sync settings.yaml failed: ${err && err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Ollama Cloud multi-account failover proxy (in-process, binds 127.0.0.1)
+// ---------------------------------------------------------------------------
+// Key pool lives in ~/.dsh/ollama-proxy.json (one ollama.com API key per
+// subscription account), shared with the CLI runner and NOT part of the repo.
+function ollamaProxyConfigPath() {
+  return path.join(DSH_HOME, 'ollama-proxy.json');
+}
+
+function readOllamaProxyConfig() {
+  try {
+    const raw = fs.readFileSync(ollamaProxyConfigPath(), 'utf8');
+    const cfg = JSON.parse(raw);
+    cfg.keys = (Array.isArray(cfg.keys) ? cfg.keys : []).map((k) => String(k).trim()).filter(Boolean);
+    return cfg;
+  } catch (_err) {
+    return { enabled: true, port: OLLAMA_PROXY_DEFAULT_PORT, keys: [], activeIndex: 0, usage: [] };
+  }
+}
+
+function writeOllamaProxyConfig({ enabled, port, keys }) {
+  const prev = readOllamaProxyConfig();
+  const next = {
+    enabled: enabled !== false,
+    port: Number(port) || OLLAMA_PROXY_DEFAULT_PORT,
+    keys,
+    activeIndex: 0,
+    usage: keys.map((_k, i) => (prev.usage && prev.usage[i]) || { requests: 0, inputTokens: 0, outputTokens: 0, quotaFailures: 0, lastUsedAt: null, lastError: null }),
+  };
+  fs.mkdirSync(path.dirname(ollamaProxyConfigPath()), { recursive: true });
+  fs.writeFileSync(ollamaProxyConfigPath(), JSON.stringify(next, null, 2), 'utf8');
+  return next;
+}
+
+let ollamaProxyHandle = null;
+
+function ollamaProxyActive() {
+  const cfg = readOllamaProxyConfig();
+  return cfg.enabled !== false && cfg.keys.length > 0;
+}
+
+function startOllamaProxyHandle() {
+  stopOllamaProxyHandle();
+  const cfg = readOllamaProxyConfig();
+  if (cfg.enabled === false || cfg.keys.length === 0) {
+    log('ollama-proxy: not started (disabled or no keys)');
+    return;
+  }
+  try {
+    ollamaProxyHandle = startOllamaProxy({
+      configPath: ollamaProxyConfigPath(),
+      log: (msg) => log(`[ollama-proxy] ${msg}`),
+    });
+    log(`ollama-proxy: listening on http://127.0.0.1:${ollamaProxyHandle.getState().port}`);
+    syncOllamaBaseUrl(true);
+  } catch (err) {
+    log(`ollama-proxy: start failed: ${err && err.message}`);
+    ollamaProxyHandle = null;
+  }
+}
+
+function stopOllamaProxyHandle() {
+  if (ollamaProxyHandle) {
+    try { ollamaProxyHandle.stop(); } catch (_err) { /* ignore */ }
+    ollamaProxyHandle = null;
+  }
+}
+
+// Keep settings.yaml's ollama route pointing at the local proxy while it is
+// active, and back at the local daemon (127.0.0.1:11434/v1) when it is not.
+function syncOllamaBaseUrl(active) {
+  try {
+    const settingsFile = path.join(DSH_HOME, 'settings.yaml');
+    const existing = readText(settingsFile) || '';
+    const lines = existing.split(/\r?\n/);
+    const idx = lines.findIndex((l) => /^    ollama:\s*$/.test(l));
+    if (idx < 0) return;
+    let end = idx;
+    for (let i = idx + 1; i < lines.length; i++) {
+      if (lines[i].trim() === '' || /^\s{6,}\S/.test(lines[i])) end = i;
+      else break;
+    }
+    const block = lines.slice(idx + 1, end + 1).filter((l) => !/^\s{6}baseURL:\s*/.test(l));
+    const port = readOllamaProxyConfig().port || OLLAMA_PROXY_DEFAULT_PORT;
+    const baseLine = `      baseURL: ${active ? `http://127.0.0.1:${port}` : 'http://127.0.0.1:11434/v1'}`;
+    const apiIdx = block.findIndex((l) => /^\s{6}apiKeyEnv:\s*/.test(l));
+    block.splice(apiIdx >= 0 ? apiIdx + 1 : 0, 0, baseLine);
+    const next = [...lines.slice(0, idx), '    ollama:', ...block, ...lines.slice(end + 1)].join('\n');
+    if (next !== existing) {
+      fs.writeFileSync(settingsFile, next, 'utf8');
+      log(`ollama-proxy: settings.yaml ollama baseURL ${active ? '→ 127.0.0.1:' + port : '→ local daemon'}`);
+    }
+  } catch (err) {
+    log(`ollama-proxy: sync settings.yaml failed: ${err && err.message}`);
   }
 }
 
@@ -586,6 +684,26 @@ function stopBackend() {
   }
 }
 
+// Probe whether the detected dsh build supports the `web --no-open` flag.
+// Cached per dshBin path so a settings change re-probes.
+let dshNoOpenCache = { bin: null, supports: false };
+function dshSupportsNoOpen(nodeExe, dshBin) {
+  if (dshNoOpenCache.bin === dshBin) return dshNoOpenCache.supports;
+  let supports = false;
+  try {
+    const result = spawnSync(nodeExe, [dshBin, 'web', '--help'], {
+      windowsHide: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    });
+    supports = /--no-open/.test(`${result.stdout || ''}${result.stderr || ''}`);
+  } catch (_err) {
+    supports = false;
+  }
+  dshNoOpenCache = { bin: dshBin, supports };
+  return supports;
+}
+
 async function startBackend() {
   const config = loadConfig();
   const runtime = detectRuntime();
@@ -595,7 +713,10 @@ async function startBackend() {
   const port = await pickPort(config);
   backendUrl = `http://${config.host}:${port}`;
 
-  const args = [runtime.dshBin, 'web', '--host', config.host, '--port', String(port), '--no-open'];
+  const args = [runtime.dshBin, 'web', '--host', config.host, '--port', String(port)];
+  // `--no-open` only exists in newer dsh builds; probe the detected bin so an
+  // older npx-cache dsh on another device can still boot.
+  if (dshSupportsNoOpen(runtime.nodeExe, runtime.dshBin)) args.push('--no-open');
   const env = { ...process.env, DSH_HOME: config.dshHome || DSH_HOME };
 
   log(`spawning node="${runtime.nodeExe}" args="${args.join(' ')}" DSH_HOME=${env.DSH_HOME}`);
@@ -833,6 +954,23 @@ function settingsHtml() {
   </section>
 
   <section>
+    <h2>Ollama Cloud 多账号代理（故障转移）</h2>
+    <p class="hint">把多个 ollama.com 订阅账号的 API Key 放进轮换池，某账号额度耗尽（401/402/429）时自动切换下一个账号并重试。DSH 的 <code>ollama</code> 路由会自动指向本机代理（直连 ollama.com，无需本地 ollama 应用）。Key 仅保存在本机 DSH_HOME。</p>
+    <label class="check"><input id="ollamaProxyEnabled" type="checkbox"> 启用本地代理</label>
+    <label for="ollamaProxyPort">代理端口</label>
+    <input id="ollamaProxyPort" type="number" min="1024" max="65535" placeholder="8788">
+    <label for="ollamaProxyKeys">API Key 列表（每行一个账号，按顺序轮换）</label>
+    <textarea id="ollamaProxyKeys" rows="4" placeholder="每行一个 ollama.com API Key" spellcheck="false"></textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="ollamaProxySave" type="button">保存代理配置</button>
+      <button id="ollamaProxyRotate" type="button">立即切换下一账号</button>
+      <button id="ollamaProxyRefresh" type="button">刷新用量</button>
+    </div>
+    <div id="ollamaProxyUsage"></div>
+    <div id="ollamaProxyStatus"></div>
+  </section>
+
+  <section>
     <h2>DeepSeek 官方 API 余额</h2>
     <p class="hint">调用 DeepSeek 官方余额接口（<code>api.deepseek.com/user/balance</code>），凭据取自 <code>.credentials.yaml</code> 里的 <code>DEEPSEEK_API_KEY</code>。</p>
     <div class="row">
@@ -912,15 +1050,21 @@ function settingsHtml() {
     const rows = usage.map((u, i) => {
       const active = i === state.activeIndex ? ' class="active"' : '';
       const last = u.lastUsedAt ? new Date(u.lastUsedAt).toLocaleTimeString() : '—';
+      let errCell = '—';
+      if (u.lastError) {
+        const t = String(u.lastError.text || '').replace(/[<>&"]/g, '').slice(0, 60);
+        errCell = '<span title="' + t + '">' + (u.lastError.status || '?') + '</span>';
+      }
       return '<tr' + active + '><td>' + (active ? '● ' : '○ ') + maskKey((state.keys || [])[i]) + '</td>' +
         '<td>' + (u.requests || 0) + ' 次</td>' +
         '<td>入 ' + fmtTokens(u.inputTokens) + '</td>' +
         '<td>出 ' + fmtTokens(u.outputTokens) + '</td>' +
         '<td>失败 ' + (u.quotaFailures || 0) + '</td>' +
+        '<td>' + errCell + '</td>' +
         '<td>' + last + '</td></tr>';
     }).join('');
     $('proxyUsage').innerHTML =
-      '<table class="usage-table"><thead><tr><th>Key（● = 当前）</th><th>请求</th><th>输入</th><th>输出</th><th>配额失败</th><th>最近使用</th></tr></thead>' +
+      '<table class="usage-table"><thead><tr><th>Key（● = 当前）</th><th>请求</th><th>输入</th><th>输出</th><th>配额失败</th><th>最近错误</th><th>最近使用</th></tr></thead>' +
       '<tbody>' + rows + '</tbody></table>';
   }
   async function loadProxy() {
@@ -957,6 +1101,74 @@ function settingsHtml() {
     setProxyStatus('已刷新', 'ok');
   });
   void loadProxy();
+
+  // ---- Ollama Cloud 多账号代理 ----
+  function maskOllamaKey(k) {
+    if (!k) return '';
+    return k.length <= 10 ? '******' : k.slice(0, 8) + '…' + k.slice(-4);
+  }
+  function setOllamaProxyStatus(msg, cls) { const el = $('ollamaProxyStatus'); el.textContent = msg || ''; el.className = cls || ''; }
+  function renderOllamaProxy(state) {
+    if (!state) return;
+    $('ollamaProxyEnabled').checked = state.enabled !== false;
+    $('ollamaProxyPort').value = state.port || 8788;
+    $('ollamaProxyKeys').value = (state.keys || []).join('\\n');
+    const usage = state.usage || [];
+    if (!usage.length) { $('ollamaProxyUsage').innerHTML = ''; return; }
+    const rows = usage.map((u, i) => {
+      const active = i === state.activeIndex ? ' class="active"' : '';
+      const last = u.lastUsedAt ? new Date(u.lastUsedAt).toLocaleTimeString() : '—';
+      let errCell = '—';
+      if (u.lastError) {
+        const t = String(u.lastError.text || '').replace(/[<>&"]/g, '').slice(0, 60);
+        errCell = '<span title="' + t + '">' + (u.lastError.status || '?') + '</span>';
+      }
+      return '<tr' + active + '><td>' + (active ? '● ' : '○ ') + maskOllamaKey((state.keys || [])[i]) + '</td>' +
+        '<td>' + (u.requests || 0) + ' 次</td>' +
+        '<td>入 ' + fmtTokens(u.inputTokens) + '</td>' +
+        '<td>出 ' + fmtTokens(u.outputTokens) + '</td>' +
+        '<td>失败 ' + (u.quotaFailures || 0) + '</td>' +
+        '<td>' + errCell + '</td>' +
+        '<td>' + last + '</td></tr>';
+    }).join('');
+    $('ollamaProxyUsage').innerHTML =
+      '<table class="usage-table"><thead><tr><th>账号（● = 当前）</th><th>请求</th><th>输入</th><th>输出</th><th>配额失败</th><th>最近错误</th><th>最近使用</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table>';
+  }
+  async function loadOllamaProxy() {
+    const res = await window.dshDesktop.ollamaProxyGetState();
+    if (res && res.ok) {
+      renderOllamaProxy(res);
+      setOllamaProxyStatus(res.running ? '代理运行中：' + res.url : '代理未运行' + (res.enabled !== false ? '（无 Key 或未启用）' : '（已停用）'), res.running ? 'ok' : '');
+    } else {
+      setOllamaProxyStatus((res && res.error) || '读取代理状态失败', 'err');
+    }
+  }
+  $('ollamaProxySave').addEventListener('click', async () => {
+    setOllamaProxyStatus('正在保存…');
+    const keys = $('ollamaProxyKeys').value.split(/\\r?\\n/).map((s) => s.trim()).filter(Boolean);
+    const res = await window.dshDesktop.ollamaProxySaveConfig({
+      enabled: $('ollamaProxyEnabled').checked,
+      port: Number($('ollamaProxyPort').value) || 8788,
+      keys,
+    });
+    if (res && res.ok) {
+      renderOllamaProxy(res.state);
+      setOllamaProxyStatus(res.state.running ? '已保存，代理运行中：' + res.state.url : '已保存，代理已停用', res.state.running ? 'ok' : '');
+    } else {
+      setOllamaProxyStatus((res && res.error) || '保存失败', 'err');
+    }
+  });
+  $('ollamaProxyRotate').addEventListener('click', async () => {
+    const res = await window.dshDesktop.ollamaProxyRotate();
+    if (res && res.ok) { renderOllamaProxy(res.state); setOllamaProxyStatus('已切换到下一账号', 'ok'); }
+    else setOllamaProxyStatus((res && res.error) || '切换失败', 'err');
+  });
+  $('ollamaProxyRefresh').addEventListener('click', async () => {
+    await loadOllamaProxy();
+    setOllamaProxyStatus('已刷新', 'ok');
+  });
+  void loadOllamaProxy();
 
   // ---- DeepSeek 官方余额 ----
   async function loadBalance() {
@@ -1183,6 +1395,61 @@ if (!gotSingleInstanceLock) {
     return await fetchDeepSeekBalance(key);
   });
 
+  // ---- Ollama Cloud 多账号代理 ------------------------------------------
+  ipcMain.handle('dsh:ollama-proxy-get-state', () => {
+    const cfg = readOllamaProxyConfig();
+    const live = ollamaProxyHandle ? ollamaProxyHandle.getState() : null;
+    return {
+      ok: true,
+      running: Boolean(live),
+      url: live ? live.url : `http://127.0.0.1:${cfg.port || OLLAMA_PROXY_DEFAULT_PORT}`,
+      enabled: cfg.enabled !== false,
+      port: cfg.port || OLLAMA_PROXY_DEFAULT_PORT,
+      keys: cfg.keys,
+      activeIndex: live ? live.activeIndex : cfg.activeIndex,
+      usage: live ? live.usage : cfg.usage,
+      configPath: ollamaProxyConfigPath(),
+    };
+  });
+
+  ipcMain.handle('dsh:ollama-proxy-save-config', (_event, payload) => {
+    try {
+      const enabled = payload && payload.enabled !== undefined ? payload.enabled !== false : true;
+      const port = Number(payload && payload.port) || OLLAMA_PROXY_DEFAULT_PORT;
+      const keys = Array.isArray(payload && payload.keys)
+        ? payload.keys.map((k) => String(k).trim()).filter(Boolean)
+        : [];
+      writeOllamaProxyConfig({ enabled, port, keys });
+      startOllamaProxyHandle();
+      return { ok: true, state: ipcMainOllamaState() };
+    } catch (err) {
+      log(`ollama-proxy-save-config failed: ${err && err.message}`);
+      return { ok: false, error: String(err && err.message || err) };
+    }
+  });
+
+  ipcMain.handle('dsh:ollama-proxy-rotate', () => {
+    try {
+      const live = ollamaProxyHandle ? ollamaProxyHandle.rotate() : null;
+      return { ok: true, state: live || ipcMainOllamaState() };
+    } catch (err) {
+      return { ok: false, error: String(err && err.message || err) };
+    }
+  });
+
+  function ipcMainOllamaState() {
+    const cfg = readOllamaProxyConfig();
+    return {
+      running: Boolean(ollamaProxyHandle),
+      url: `http://127.0.0.1:${cfg.port || OLLAMA_PROXY_DEFAULT_PORT}`,
+      enabled: cfg.enabled !== false,
+      port: cfg.port || OLLAMA_PROXY_DEFAULT_PORT,
+      keys: cfg.keys,
+      activeIndex: cfg.activeIndex,
+      usage: cfg.usage,
+    };
+  }
+
   function ipcMainStateProxy() {
     const cfg = readProxyConfig();
     return {
@@ -1264,6 +1531,7 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(() => {
     setMenu();
     startProxy();
+    startOllamaProxyHandle();
     const window = createMainWindow();
 
     if (isFirstRun()) {
@@ -1288,11 +1556,13 @@ if (!gotSingleInstanceLock) {
   app.on('before-quit', () => {
     stopBackend();
     stopProxy();
+    stopOllamaProxyHandle();
   });
 
   app.on('will-quit', () => {
     stopBackend();
     stopProxy();
+    stopOllamaProxyHandle();
   });
 
   let bootInFlight = false;

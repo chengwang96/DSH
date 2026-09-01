@@ -1,32 +1,30 @@
 'use strict';
 
 /**
- * OpenCode Go/Zen 本地故障转移代理（核心模块，供桌面应用与 CLI 共用）。
+ * Ollama Cloud 多账号故障转移代理（核心模块，供桌面应用与 CLI 共用）。
  *
- * - 把多个 OpenCode API Key 组成一个轮换池：请求遇 401/402/429（或 403 + 配额文案）
- *   时自动切换到下一把 Key 并重放同一请求，对上游客户端（DSH）完全透明。
- * - 按 Key 统计请求数与输入/输出 token（流式请求从 SSE 末尾的 usage 块读取）。
- * - 改写出站 JSON 中 `messages[].role: "developer"` 为 `"system"`，因为 DSH 把
- *   baseURL 指向本代理后，pi-ai 的兼容性自动检测会启用 developer 角色，而
- *   OpenCode 端点会静默忽略 developer 角色（实测），改写可保住系统提示词。
- * - 路径分发：`/v1/messages*` → https://opencode.ai/zen/go（Anthropic 协议），
- *   其余 → https://opencode.ai/zen/go/v1（OpenAI 协议，去掉多余的 /v1 前缀）。
- * - 管理端点（仅 127.0.0.1）：GET /__proxy/state、POST /__proxy/rotate、
- *   POST /__proxy/reload。
+ * - 把多个 ollama.com 云 API Key（每个订阅账号一个）组成轮换池：请求遇
+ *   401/402/429（或 403 + 配额文案）时自动切换下一把 Key 并重放同一请求。
+ * - 直接转发到 ollama.com 的 OpenAI 兼容端点 https://ollama.com/v1，因此
+ *   不需要本地 ollama 守护进程、也不需要切换设备密钥对。
+ * - 按 Key 统计请求数与输入/输出 token（流式从 SSE 末尾 usage 块读取）。
+ * - 管理端点（仅 127.0.0.1）：GET /__ollama/state、POST /__ollama/rotate、
+ *   POST /__ollama/reload。
  *
- * 配置文件（默认 ~/.dsh/opencode-proxy.json）：
- *   { "enabled": true, "port": 8787, "keys": ["sk-..."], "activeIndex": 0,
- *     "usage": [ { "requests": 0, "inputTokens": 0, "outputTokens": 0,
- *                  "quotaFailures": 0, "lastUsedAt": null } ] }
+ * 配置文件（默认 ~/.dsh/ollama-proxy.json）：
+ *   { "enabled": true, "port": 8788, "keys": ["<key1>", "<key2>", "<key3>"],
+ *     "activeIndex": 0, "usage": [ { "requests": 0, "inputTokens": 0,
+ *     "outputTokens": 0, "quotaFailures": 0, "lastUsedAt": null,
+ *     "lastError": null } ] }
  */
 
 const http = require('node:http');
 const https = require('node:https');
 const fs = require('node:fs');
+const path = require('node:path');
 
-const DEFAULT_PORT = 8787;
-const UPSTREAM_ANTHROPIC = 'https://opencode.ai/zen/go';
-const UPSTREAM_OPENAI = 'https://opencode.ai/zen/go/v1';
+const DEFAULT_PORT = 8788;
+const UPSTREAM_BASE = 'https://ollama.com';
 
 // ---------------------------------------------------------------------------
 // 配置读写
@@ -51,14 +49,10 @@ function loadConfig(configPath, fallbackPort) {
   try {
     const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     const cfg = { ...defaultConfig(fallbackPort), ...raw };
-    cfg.keys = (Array.isArray(cfg.keys) ? cfg.keys : [])
-      .map((k) => String(k).trim())
-      .filter(Boolean);
+    cfg.keys = (Array.isArray(cfg.keys) ? cfg.keys : []).map((k) => String(k).trim()).filter(Boolean);
     cfg.port = Number(cfg.port) || fallbackPort || DEFAULT_PORT;
     cfg.activeIndex = Number.isInteger(cfg.activeIndex) ? cfg.activeIndex : 0;
-    if (cfg.keys.length === 0 || cfg.activeIndex < 0 || cfg.activeIndex >= cfg.keys.length) {
-      cfg.activeIndex = 0;
-    }
+    if (cfg.keys.length === 0 || cfg.activeIndex < 0 || cfg.activeIndex >= cfg.keys.length) cfg.activeIndex = 0;
     const prevUsage = Array.isArray(cfg.usage) ? cfg.usage : [];
     cfg.usage = cfg.keys.map((_k, i) => normalizeUsage(prevUsage[i]));
     return cfg;
@@ -70,10 +64,8 @@ function loadConfig(configPath, fallbackPort) {
 function maskKey(key) {
   const s = String(key || '').trim();
   if (!s) return '';
-  if (s.startsWith('sk-')) {
-    return s.length <= 12 ? 'sk-***' : `${s.slice(0, 7)}…${s.slice(-4)}`;
-  }
-  return s.length <= 6 ? '******' : `${s.slice(0, 2)}…${s.slice(-2)}`;
+  if (s.length <= 10) return '******';
+  return `${s.slice(0, 8)}…${s.slice(-4)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +73,7 @@ function maskKey(key) {
 // ---------------------------------------------------------------------------
 function isQuotaFailure(status, text) {
   if (status === 401 || status === 402 || status === 429) return true;
-  if (status === 403 && /quota|limit|plan|entitle|subscription|exceed/i.test(String(text || ''))) return true;
+  if (status === 403 && /quota|limit|plan|entitle|subscription|exceed|credit/i.test(String(text || ''))) return true;
   return false;
 }
 
@@ -94,7 +86,7 @@ function isStreamRequest(bodyBuf) {
   }
 }
 
-/** developer 角色 → system（OpenCode 端点静默忽略 developer 角色）。 */
+/** developer 角色 → system（GLM/Kimi 等模型会静默忽略 developer 角色）。 */
 function transformBody(bodyBuf) {
   if (!bodyBuf || !bodyBuf.length) return bodyBuf;
   try {
@@ -114,12 +106,9 @@ function transformBody(bodyBuf) {
   }
 }
 
-function upstreamTarget(pathname) {
-  if (pathname.startsWith('/v1/messages')) {
-    return { base: UPSTREAM_ANTHROPIC, path: pathname };
-  }
-  const p = pathname.replace(/^\/v1(?=\/)/, '');
-  return { base: UPSTREAM_OPENAI, path: p || '/chat/completions' };
+function upstreamPath(pathname) {
+  if (pathname.startsWith('/v1')) return pathname;
+  return `/v1${pathname}`;
 }
 
 function buildUpstreamHeaders(req, key) {
@@ -130,7 +119,6 @@ function buildUpstreamHeaders(req, key) {
     headers[k] = v;
   }
   headers.authorization = `Bearer ${key}`;
-  // 强制明文传输：SSE 用量扫描需要未压缩的响应。
   headers['accept-encoding'] = 'identity';
   return headers;
 }
@@ -161,7 +149,6 @@ function parseUsageFromJson(bodyBuf) {
   }
 }
 
-/** 从 SSE 数据流中抓取最后的 usage 块（choices:[] + usage）。 */
 class SseUsageScanner {
   constructor() {
     this.buffer = '';
@@ -193,16 +180,12 @@ class SseUsageScanner {
 // ---------------------------------------------------------------------------
 // 单次上游转发
 // ---------------------------------------------------------------------------
-function forwardOnce(state, keyIndex, req, bodyBuf, streamMode, clientRes, log) {
+function forwardOnce(state, keyIndex, req, bodyBuf, streamMode, clientRes) {
   return new Promise((resolve, reject) => {
     const url = new URL(req.url, 'http://localhost');
-    const target = upstreamTarget(url.pathname);
-    const upstreamUrl = new URL(target.base);
+    const targetPath = upstreamPath(url.pathname);
+    const upstreamUrl = new URL(UPSTREAM_BASE);
     const headers = buildUpstreamHeaders(req, state.keys[keyIndex]);
-    if (target.path.startsWith('/v1/messages')) {
-      // OpenCode 的 Anthropic 协议端点按 x-api-key 鉴权
-      headers['x-api-key'] = state.keys[keyIndex];
-    }
     headers['content-length'] = Buffer.byteLength(bodyBuf);
 
     const upstreamReq = https.request(
@@ -211,13 +194,12 @@ function forwardOnce(state, keyIndex, req, bodyBuf, streamMode, clientRes, log) 
         hostname: upstreamUrl.hostname,
         port: upstreamUrl.port || 443,
         method: req.method,
-        path: `${upstreamUrl.pathname.replace(/\/+$/, '')}${target.path}`,
+        path: `${upstreamUrl.pathname.replace(/\/+$/, '')}${targetPath}`,
         headers,
       },
       (ures) => {
         const status = ures.statusCode || 502;
         if (streamMode && status < 400) {
-          // 流式成功：逐块透传 + SSE 用量扫描
           const outHeaders = {};
           for (const [k, v] of Object.entries(ures.headers || {})) {
             const lower = k.toLowerCase();
@@ -234,12 +216,11 @@ function forwardOnce(state, keyIndex, req, bodyBuf, streamMode, clientRes, log) 
             clientRes.end();
             resolve({ ok: true, streamed: true, usage: scanner.lastUsage });
           });
-          ures.on('error', (err) => {
-            clientRes.destroy(err);
+          ures.on('error', () => {
+            clientRes.destroy();
             resolve({ ok: true, streamed: true, usage: scanner.lastUsage, aborted: true });
           });
         } else {
-          // 缓冲响应（错误或非流式）：需要读 body 判断配额错误 / 统计用量
           const chunks = [];
           ures.on('data', (c) => chunks.push(c));
           ures.on('end', () => {
@@ -260,7 +241,7 @@ function forwardOnce(state, keyIndex, req, bodyBuf, streamMode, clientRes, log) 
 // ---------------------------------------------------------------------------
 // 服务器主体
 // ---------------------------------------------------------------------------
-function startOpenCodeProxy({ configPath, log = () => {} }) {
+function startOllamaProxy({ configPath, log = () => {} }) {
   const initial = loadConfig(configPath, DEFAULT_PORT);
   const state = {
     configPath,
@@ -278,14 +259,8 @@ function startOpenCodeProxy({ configPath, log = () => {} }) {
     saveTimer = setTimeout(() => {
       saveTimer = null;
       try {
-        const doc = {
-          enabled: state.enabled,
-          port: state.port,
-          keys: state.keys,
-          activeIndex: state.activeIndex,
-          usage: state.usage,
-        };
-        fs.mkdirSync(require('node:path').dirname(configPath), { recursive: true });
+        const doc = { enabled: state.enabled, port: state.port, keys: state.keys, activeIndex: state.activeIndex, usage: state.usage };
+        fs.mkdirSync(path.dirname(configPath), { recursive: true });
         fs.writeFileSync(configPath, JSON.stringify(doc, null, 2), 'utf8');
       } catch (err) {
         log(`save failed: ${err && err.message}`);
@@ -327,7 +302,7 @@ function startOpenCodeProxy({ configPath, log = () => {} }) {
 
   async function handleModelRequest(req, res, bodyBuf) {
     if (state.keys.length === 0) {
-      respondJson(res, 502, { error: { message: 'opencode proxy: no API keys configured' } });
+      respondJson(res, 502, { error: { message: 'ollama proxy: no API keys configured' } });
       return;
     }
     const streamMode = isStreamRequest(bodyBuf);
@@ -342,7 +317,7 @@ function startOpenCodeProxy({ configPath, log = () => {} }) {
       tried.add(idx);
       let result;
       try {
-        result = await forwardOnce(state, idx, req, outBody, streamMode, res, log);
+        result = await forwardOnce(state, idx, req, outBody, streamMode, res);
       } catch (err) {
         log(`key #${idx} (${maskKey(state.keys[idx])}) transport error: ${err && err.message}`);
         lastFailure = { streamed: false, status: 502, headers: { 'content-type': 'application/json' }, body: Buffer.from(JSON.stringify({ error: { message: `upstream error: ${err && err.message}` } })) };
@@ -372,7 +347,6 @@ function startOpenCodeProxy({ configPath, log = () => {} }) {
         lastFailure = result;
         continue;
       }
-      // 非配额类失败（如 400/404）：直接透传，不轮换
       writeBufferedResponse(res, result);
       return;
     }
@@ -381,7 +355,7 @@ function startOpenCodeProxy({ configPath, log = () => {} }) {
       log('all keys failed, returning last upstream error');
       writeBufferedResponse(res, lastFailure);
     } else {
-      respondJson(res, 502, { error: { message: 'opencode proxy: no usable key' } });
+      respondJson(res, 502, { error: { message: 'ollama proxy: no usable key' } });
     }
   }
 
@@ -390,11 +364,11 @@ function startOpenCodeProxy({ configPath, log = () => {} }) {
     const url = new URL(req.url, 'http://localhost');
     const pathname = url.pathname;
 
-    if (pathname === '/__proxy/state' && req.method === 'GET') {
+    if (pathname === '/__ollama/state' && req.method === 'GET') {
       respondJson(res, 200, publicState());
       return;
     }
-    if (pathname === '/__proxy/rotate' && req.method === 'POST') {
+    if (pathname === '/__ollama/rotate' && req.method === 'POST') {
       if (state.keys.length > 1) {
         state.activeIndex = (state.activeIndex + 1) % state.keys.length;
         scheduleSave();
@@ -403,7 +377,7 @@ function startOpenCodeProxy({ configPath, log = () => {} }) {
       respondJson(res, 200, publicState());
       return;
     }
-    if (pathname === '/__proxy/reload' && req.method === 'POST') {
+    if (pathname === '/__ollama/reload' && req.method === 'POST') {
       const fresh = loadConfig(configPath, state.port);
       state.enabled = fresh.enabled !== false;
       state.keys = fresh.keys;
@@ -437,7 +411,6 @@ function startOpenCodeProxy({ configPath, log = () => {} }) {
   server.listen(state.port, '127.0.0.1', () => {
     log(`listening on http://127.0.0.1:${state.port}`);
   });
-  // 端口被占等异步错误只记录、不抛出：桌面应用不能因此崩溃。
   server.on('error', (err) => {
     bindError = err;
     log(`server error: ${err && err.message}`);
@@ -475,4 +448,4 @@ function startOpenCodeProxy({ configPath, log = () => {} }) {
   };
 }
 
-module.exports = { startOpenCodeProxy, loadConfig, maskKey, DEFAULT_PORT };
+module.exports = { startOllamaProxy, loadConfig, maskKey, DEFAULT_PORT };

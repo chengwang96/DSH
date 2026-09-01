@@ -35,6 +35,7 @@ llm-pi-ai:
         - id: "kimi-k3:cloud"
           name: Kimi K3 (cloud)
           contextWindow: 1048576
+          input: [text, image]
           reasoningEfforts: false
         - id: "gpt-oss:120b-cloud"
           name: GPT-OSS 120B (cloud)
@@ -141,7 +142,9 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:11434/v1/chat/completions' -Method Post
     max: high
   ```
   云端后端不一定认 `max`，稳妥做法是把 `max` 映射到后端确认支持的 `high`。
-- **不要**写 `maxTokens`：不写则按路由默认能力（32768）算，且不会变成每请求的封顶；写了就会成为每次请求的默认上限。
+- **视觉模型必须显式声明 `input: [text, image]`**：DSH 在放行图片前查模型声明的输入模态（入口层和 pi-ai 适配器两道闸），解析顺序是 条目 `input` → pi-ai 内置目录 → 路由 `defaultInput`（默认 `[text]`）。pi-ai 内置目录**没有 ollama 路由**，所以 ollama 下不写 `input` 的模型一律被当成纯文本，GUI 直接拒发图片。只给实际支持视觉的模型声明，虚报会在上游端点报错。
+  - 实测方法（以 kimi-k3:cloud 为例）：`POST http://127.0.0.1:11434/v1/chat/completions`，message content 用 `image_url`（`data:image/png;base64,...`）+ 文本提问；能正确答出图中内容即可声明。
+  - 已实测判定（Ollama 云端，带图提问，图内含随机 6 位验证码）：**支持** `kimi-k3:cloud`；**不支持** `gpt-oss:120b-cloud`、`deepseek-v4-pro:cloud`、`deepseek-v4-flash:cloud`、`glm-5.2:cloud`（端点均明确返回 `400 this model does not support image input`）。同日另实测 opencode-go 目录：`qwen3.7-max`、`mimo-v2.5-pro`、`hy3`、两个 deepseek-v4、`glm-5.1` 也不收图；目录内 `kimi-k2.6 / k2.7-code / k3`、`minimax-m3`、`qwen3.6-plus / 3.7-plus`、`mimo-v2.5`、`grok-4.5` 已自带 `text+image` 声明，开箱即用。
 - `contextWindow` 按模型 config blob 里的 `context_length` 填（deepseek 1M=1048576，glm-5.2 1M=1000000，gpt-oss 128K=131072）。
 
 ## 8. 验证与热加载
@@ -333,3 +336,59 @@ Authorization: Bearer <DEEPSEEK_API_KEY>
 ```powershell
 curl -H "Authorization: Bearer <你的 DEEPSEEK_API_KEY>" https://api.deepseek.com/user/balance
 ```
+
+## 14. Ollama Cloud 多账号自动轮询（本项目自带功能）
+
+ollama.com 现在提供 **API Key**（每个订阅账号一个）和 **OpenAI 兼容端点**
+`https://ollama.com/v1/chat/completions`（实测支持 `developer` 角色、`reasoning` 字段、
+SSE 流式）。因此多账号轮询不再需要切换本地 ollama 应用的设备密钥对，而是像 opencode
+一样走本地故障转移代理。
+
+### 14.1 原理
+
+- 仓库内置 `ollama-proxy.js`（核心）+ `ollama-proxy-cli.js`（独立运行入口）。
+- Key 池存在 `~/.dsh/ollama-proxy.json`（**不要提交进仓库**），每个账号一把 Key：
+  ```json
+  { "enabled": true, "port": 8788, "keys": ["<账号1 key>", "<账号2 key>", "<账号3 key>"],
+    "activeIndex": 0, "usage": [ { "requests": 0, "inputTokens": 0,
+    "outputTokens": 0, "quotaFailures": 0, "lastUsedAt": null, "lastError": null } ] }
+  ```
+- 代理直连 `https://ollama.com/v1`，**不需要本地 ollama 守护进程**；某账号额度耗尽
+  （401/402/429，或 403 + 配额文案）时自动切换下一账号并重放请求。
+- DSH 的 `ollama` 路由 `baseURL` 由桌面应用自动指向 `http://127.0.0.1:8788`（停用时
+  自动改回本地守护进程 `http://127.0.0.1:11434/v1`）。
+
+### 14.2 桌面应用方式（推荐）
+
+1. 桌面应用 → 菜单 **DeepSeek Harness → 设置…** → 「Ollama Cloud 多账号代理」区块：
+   - 勾选启用、填端口（默认 8788）、**每行一个账号的 API Key**；
+   - 点「保存代理配置」，下方表格显示每个账号的用量、配额失败次数、最近错误与当前账号（●）；
+   - 「立即切换下一账号」手动轮换，「刷新用量」拉取最新统计。
+2. 保存后代理立即生效，DSH 的 `ollama` 路由自动指向代理（settings.yaml 热加载）。
+
+### 14.3 独立 CLI 方式（不用桌面应用的设备）
+
+```powershell
+node ollama-proxy-cli.js            # 默认端口 8788，配置 ~/.dsh/ollama-proxy.json
+node ollama-proxy-cli.js --port 8790 --config <路径>
+```
+
+然后在 `settings.yaml` 手动把 `ollama` 路由的 `baseURL` 改成 `http://127.0.0.1:8788`。
+
+管理端点（仅 127.0.0.1）：
+
+```powershell
+curl http://127.0.0.1:8788/__ollama/state    # GET  状态与每个账号用量
+curl -X POST http://127.0.0.1:8788/__ollama/rotate  # 手动切换下一账号
+curl -X POST http://127.0.0.1:8788/__ollama/reload  # 重新加载配置
+```
+
+### 14.4 验证方法
+
+- 状态接口：`GET /__ollama/state` 应返回 `activeIndex` 与每个账号的 `requests/quotaFailures`。
+- 轮换验证：把一把假 Key 放第 1 位、真 Key 放第 2 位，发一个请求 → 应成功返回，
+  且 state 中 `activeIndex=1`、假 Key 的 `quotaFailures=1`、`lastError.status=401`。
+
+> 注：仓库里另有 `ollama-switch-account.ps1`（基于设备密钥对切换本地 ollama 应用账号），
+> 在改用 API Key 代理后已非必需，仅当你还需要切换本地 ollama 应用本身（如
+> `ollama launch` 集成）时使用。

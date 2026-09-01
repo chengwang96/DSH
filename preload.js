@@ -18,6 +18,10 @@ contextBridge.exposeInMainWorld('dshDesktop', {
   proxyGetState: () => ipcRenderer.invoke('dsh:proxy-get-state'),
   proxySaveConfig: (payload) => ipcRenderer.invoke('dsh:proxy-save-config', payload),
   proxyRotate: () => ipcRenderer.invoke('dsh:proxy-rotate'),
+  // Ollama Cloud multi-account proxy
+  ollamaProxyGetState: () => ipcRenderer.invoke('dsh:ollama-proxy-get-state'),
+  ollamaProxySaveConfig: (payload) => ipcRenderer.invoke('dsh:ollama-proxy-save-config', payload),
+  ollamaProxyRotate: () => ipcRenderer.invoke('dsh:ollama-proxy-rotate'),
   // DeepSeek official balance
   deepseekBalance: () => ipcRenderer.invoke('dsh:deepseek-balance'),
 });
